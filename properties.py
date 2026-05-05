@@ -1,53 +1,67 @@
 import bpy
-import os
-from . import utils
 
-def generate_image_previews(self, context):
-    """Genera dinamicamente le miniature dalla cartella selezionata."""
-    enum_items = []
+class PhotoManagerSettings(bpy.types.PropertyGroup):
+    target_folder: bpy.props.StringProperty(
+        name="Origine",
+        description="Seleziona la cartella da cui importare le foto",
+        subtype='DIR_PATH',
+        default=""
+    )
+    export_folder: bpy.props.StringProperty(
+        name="Export",
+        description="Seleziona dove salvare i file elaborati",
+        subtype='DIR_PATH',
+        default=""
+    )
+    rename_prefix: bpy.props.StringProperty(name="Prefisso")
+    rename_suffix: bpy.props.StringProperty(name="Suffisso")
+    rename_find: bpy.props.StringProperty(name="Trova")
+    rename_replace: bpy.props.StringProperty(name="Sostituisci")
     
-    if context is None:
-        return enum_items
-
-    pcoll = utils.preview_collections.get("main")
-    if not pcoll:
-        return enum_items
-
-    image_dir = context.scene.photo_manager_path
-
-    if not image_dir or not os.path.exists(image_dir):
-        return enum_items
-
-    for p in pcoll:
-        pcoll.remove(p)
-
-    valid_extensions = ('.png', '.jpg', '.jpeg')
-    
-    for i, filename in enumerate(os.listdir(image_dir)):
-        if filename.lower().endswith(valid_extensions):
-            filepath = os.path.join(image_dir, filename)
-            
-            if filepath not in pcoll:
-                thumb = pcoll.load(filepath, filepath, 'IMAGE')
-            else:
-                thumb = pcoll[filepath]
-                
-            enum_items.append((filepath, filename, "", thumb.icon_id, i))
-
-    return enum_items
-
-def register_properties():
-    bpy.types.Scene.photo_manager_path = bpy.props.StringProperty(
-        name="Cartella",
-        description="Seleziona la cartella delle immagini",
-        subtype='DIR_PATH'
+    batch_tags: bpy.props.StringProperty(
+        name="Tags",
+        description="Inserisci i tag separati da virgola",
+        default=""
+    )
+    export_format: bpy.props.EnumProperty(
+        name="Formato",
+        description="Scegli il formato in cui convertire le immagini",
+        items=[
+            ('ORIGINAL', "Originale", "Mantiene il formato di partenza"),
+            ('PNG', "PNG", "Senza perdita di qualità, supporta trasparenza"),
+            ('JPEG', "JPEG", "Formato compresso, ideale per il web"),
+            ('BMP', "BMP", "Bitmap standard"),
+            ('TARGA', "TGA", "Formato Targa, usato spesso nei videogiochi"),
+            ('TIFF', "TIFF", "Alta qualità per la stampa")
+        ],
+        default='ORIGINAL'
+    )
+    slideshow_delay: bpy.props.FloatProperty(
+        name="Secondi",
+        description="Tempo di attesa tra una foto e l'altra",
+        default=3.0,
+        min=0.1,
+        max=60.0
     )
     
-    bpy.types.Scene.photo_manager_thumbnails = bpy.props.EnumProperty(
-        items=generate_image_previews,
-        name="Seleziona Foto"
+    # --- PROPRIETÀ PER IL RIDIMENSIONAMENTO ---
+    resize_width: bpy.props.IntProperty(
+        name="Larghezza",
+        description="Nuova larghezza in pixel",
+        default=1024,
+        min=1
+    )
+    resize_height: bpy.props.IntProperty(
+        name="Altezza",
+        description="Nuova altezza in pixel",
+        default=1024,
+        min=1
     )
 
-def unregister_properties():
-    del bpy.types.Scene.photo_manager_path
-    del bpy.types.Scene.photo_manager_thumbnails
+def register():
+    bpy.utils.register_class(PhotoManagerSettings)
+    bpy.types.Scene.photo_manager_tool = bpy.props.PointerProperty(type=PhotoManagerSettings)
+
+def unregister():
+    bpy.utils.unregister_class(PhotoManagerSettings)
+    del bpy.types.Scene.photo_manager_tool
