@@ -15,6 +15,7 @@ def get_selected_materials(context):
 def force_image_load(img):
     if not img: return
     try:
+        img.display_aspect = (1.0, 1.0) # Previene deformazioni del file
         if img.has_data and len(img.pixels) > 0: return
     except Exception: pass
     try:
@@ -29,18 +30,79 @@ def force_image_load(img):
             img.update()
     except Exception: pass
 
+# --- SISTEMA DI ZOOM "SHRINK TO FIT" CORAZZATO ---
+def apply_zoom_to_area(window, area, img):
+    """Calcola e applica lo zoom preservando rigorosamente l'aspect ratio"""
+    try:
+        region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+        if not region or region.width < 50: return False
+        
+        img_w, img_h = img.size
+        # Se l'immagine non è ancora in RAM, fermiamo il calcolo
+        if img_w < 10 or img_h < 10: return False 
+        
+        # Calcolo Shrink to Fit (5% di margine)
+        zoom_x = (region.width * 0.95) / float(img_w)
+        zoom_y = (region.height * 0.95) / float(img_h)
+        
+        # Prende il valore più piccolo ma NON supera mai 1.0 (Shrink to Fit)
+        zoom_factor = float(min(zoom_x, zoom_y, 1.0))
+        
+        space = area.spaces.active
+        
+        # Metodo 1: Assegnazione diretta
+        try:
+            space.zoom = (zoom_factor, zoom_factor)
+            if hasattr(space, "offset"): space.offset = (0.0, 0.0) # Centra
+        except: pass
+        
+        # Metodo 2: Fallback tramite operatore (se la UI non si aggiorna)
+        try:
+            with bpy.context.temp_override(window=window, area=area, region=region):
+                bpy.ops.image.view_zoom_ratio(ratio=zoom_factor)
+        except: pass
+        
+        return True
+    except Exception:
+        return False
+
+def make_delayed_zoom(img_name, retries=15):
+    """Timer continuo: aspetta che l'immagine grande sia pronta prima di zoomare"""
+    state = {'retries': retries}
+    def zoom_timer():
+        img = bpy.data.images.get(img_name)
+        if not img: return None
+        
+        for w in bpy.context.window_manager.windows:
+            for a in w.screen.areas:
+                if a.type == 'IMAGE_EDITOR' and a.spaces.active and a.spaces.active.image == img:
+                    apply_zoom_to_area(w, a, img)
+                    a.tag_redraw()
+                    
+        # Il timer continua a girare fino a esaurimento per essere sicuro 
+        # che Blender abbia caricato e renderizzato correttamente le dimensioni finali
+        state['retries'] -= 1
+        return 0.05 if state['retries'] > 0 else None
+    return zoom_timer
+
 def slideshow_timer_callback():
     global slideshow_running, viewer_images, viewer_index
     if not slideshow_running or not viewer_images: return None 
     viewer_index = (viewer_index + 1) % len(viewer_images)
     img = viewer_images[viewer_index]
     force_image_load(img)
+    
     for w in bpy.context.window_manager.windows:
         for a in w.screen.areas:
             if a.type == 'IMAGE_EDITOR': 
                 a.spaces.active.image = img
-                a.tag_redraw() 
+                a.tag_redraw()
+    
+    # Timer rapido per lo zoom post-caricamento
+    bpy.app.timers.register(make_delayed_zoom(img.name, retries=5), first_interval=0.01)
+                
     return bpy.data.scenes[0].photo_manager_tool.slideshow_delay if bpy.data.scenes else 3.0
+
 
 class PHOTOMANAGER_OT_view_nav(bpy.types.Operator):
     bl_idname = "photo.view_nav"
@@ -52,9 +114,14 @@ class PHOTOMANAGER_OT_view_nav(bpy.types.Operator):
         viewer_index = (viewer_index + self.direction) % len(viewer_images)
         img = viewer_images[viewer_index]
         force_image_load(img)
+        
         if context.area and context.area.type == 'IMAGE_EDITOR':
             context.space_data.image = img
             context.area.tag_redraw()
+            
+        # Timer per lo zoom sicuro
+        bpy.app.timers.register(make_delayed_zoom(img.name, retries=5), first_interval=0.01)
+            
         return {'FINISHED'}
 
 class PHOTOMANAGER_OT_view_image(bpy.types.Operator):
@@ -73,11 +140,18 @@ class PHOTOMANAGER_OT_view_image(bpy.types.Operator):
         if not viewer_images: return {'CANCELLED'}
         viewer_index = 0
         force_image_load(viewer_images[0])
+        
         bpy.ops.wm.window_new()
-        area = context.window_manager.windows[-1].screen.areas[0]
+        win = context.window_manager.windows[-1]
+        area = win.screen.areas[0]
         area.type = 'IMAGE_EDITOR'
-        area.spaces.active.image = viewer_images[0]
-        area.spaces.active.show_region_ui = False 
+        space = area.spaces.active
+        space.image = viewer_images[0]
+        space.show_region_ui = False 
+        
+        # Lanciamo il timer lungo (15 cicli) per dare tempo alla finestra e all'immagine di esistere
+        bpy.app.timers.register(make_delayed_zoom(viewer_images[0].name, retries=15), first_interval=0.05)
+            
         return {'FINISHED'}
 
 class PHOTOMANAGER_OT_slideshow(bpy.types.Operator):
@@ -96,29 +170,75 @@ class PHOTOMANAGER_OT_edit_image(bpy.types.Operator):
     bl_idname = "photo.edit_image"
     bl_label = "Edit Image"
     action: bpy.props.StringProperty()
+    
     def execute(self, context):
         tool = context.scene.photo_manager_tool
-        assets = get_selected_materials(context)
-        for mat in assets:
+        selected_mats = get_selected_materials(context)
+        if not selected_mats: return {'CANCELLED'}
+
+        for mat in selected_mats:
             img = next((n.image for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image), None) if mat.use_nodes else None
             if not img: continue
+            
             force_image_load(img)
             try:
-                if self.action == 'RESIZE': img.scale(tool.resize_width, tool.resize_height)
+                w, h = img.size
+                pixels = np.empty(w * h * 4, dtype=np.float32)
+                img.pixels.foreach_get(pixels)
+                pixels = pixels.reshape((h, w, 4))
+                
+                if self.action == 'RESIZE': 
+                    img.scale(tool.resize_width, tool.resize_height)
                 else:
-                    w, h = img.size
-                    pixels = np.empty(w * h * 4, dtype=np.float32)
-                    img.pixels.foreach_get(pixels)
-                    pixels = pixels.reshape((h, w, 4))
-                    if self.action == 'FLIP_H': pixels = np.fliplr(pixels)
-                    elif self.action == 'FLIP_V': pixels = np.flipud(pixels)
-                    elif self.action == 'ROT_CW': pixels = np.rot90(pixels, k=-1); w, h = h, w
-                    elif self.action == 'ROT_CCW': pixels = np.rot90(pixels, k=1); w, h = h, w
-                    if img.size[0] != w or img.size[1] != h: img.scale(w, h)
-                    img.pixels.foreach_set(pixels.ravel())
+                    if self.action == 'FLIP_H': 
+                        pixels = np.fliplr(pixels)
+                    elif self.action == 'FLIP_V': 
+                        pixels = np.flipud(pixels)
+                    elif self.action == 'ROT_CW': 
+                        pixels = np.flipud(np.transpose(pixels, (1, 0, 2)))
+                        w, h = h, w
+                    elif self.action == 'ROT_CCW': 
+                        pixels = np.fliplr(np.transpose(pixels, (1, 0, 2)))
+                        w, h = h, w
+                    
+                    if img.size[0] != w or img.size[1] != h: 
+                        img.scale(w, h)
+                    
+                    pixels = np.ascontiguousarray(pixels).flatten()
+                    img.pixels.foreach_set(pixels)
+                
+                img.display_aspect = (1.0, 1.0)
                 img.update()
-                img.save()
-            except Exception as e: print(e)
+                img.save() 
+                
+            except Exception as e: 
+                print(f"Errore Edit su {img.name}: {e}")
+
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type in {'IMAGE_EDITOR', 'VIEW_3D', 'FILE_BROWSER'}:
+                    area.tag_redraw()
+
+        return {'FINISHED'}
+
+class PHOTOMANAGER_OT_update_previews(bpy.types.Operator):
+    bl_idname = "photo.update_previews"
+    bl_label = "Update Thumbnails"
+    bl_description = "Rigenera le miniature nell'Asset Browser (Attenzione: deseleziona gli asset)"
+    
+    def execute(self, context):
+        selected_mats = get_selected_materials(context)
+        if not selected_mats: return {'CANCELLED'}
+        
+        for mat in selected_mats:
+            if hasattr(mat, "asset_generate_preview"):
+                mat.asset_generate_preview()
+                
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'FILE_BROWSER':
+                    area.tag_redraw()
+                    
         return {'FINISHED'}
 
 class PHOTOMANAGER_OT_get_dimensions(bpy.types.Operator):
@@ -145,6 +265,7 @@ class PHOTOMANAGER_OT_import_assets(bpy.types.Operator):
             file_path = os.path.abspath(os.path.join(p, f))
             img = bpy.data.images.load(file_path, check_existing=True)
             img.filepath = file_path 
+            img.display_aspect = (1.0, 1.0)
             name = os.path.splitext(f)[0]
             mat = bpy.data.materials.get(name) or bpy.data.materials.new(name=name)
             mat.use_nodes = True
@@ -167,28 +288,42 @@ class PHOTOMANAGER_OT_rename_assets(bpy.types.Operator):
         assets.sort(key=lambda m: m.name)
         dt = datetime.now().strftime("%Y%m%d")
         tm = datetime.now().strftime("%H%M")
+        
         for i, m in enumerate(assets):
             bn = m.name
             if tool.rename_remove:
                 for r in tool.rename_remove.split(','): bn = bn.replace(r.strip(), "")
-            if tool.rename_find: bn = bn.replace(tool.rename_find, tool.rename_replace)
-            if tool.rename_case == 'LOWER': bn = bn.lower()
-            elif tool.rename_case == 'UPPER': bn = bn.upper()
-            elif tool.rename_case == 'TITLE': bn = bn.replace('_', ' ').replace('-', ' ').title()
-            elif tool.rename_case == 'SNAKE': bn = re.sub(r'[\s\-]+', '_', bn).lower()
-            elif tool.rename_case == 'CAMEL':
-                parts = re.split(r'[\s_\-]+', bn)
-                if parts: bn = parts[0].lower() + ''.join(w.capitalize() for w in parts[1:])
-            elif tool.rename_case == 'PASCAL':
-                parts = re.split(r'[\s_\-]+', bn)
-                bn = ''.join(w.capitalize() for w in parts)
+            if tool.rename_find: 
+                bn = bn.replace(tool.rename_find, tool.rename_replace)
+                
+            case_type = tool.rename_case.upper()
+            
+            if case_type.startswith('LOWER'): 
+                bn = bn.lower()
+            elif case_type.startswith('UPPER'): 
+                bn = bn.upper()
+            elif case_type.startswith('TITLE'): 
+                bn = bn.replace('_', ' ').replace('-', ' ').title()
+            elif case_type.startswith('SNAKE'): 
+                bn = re.sub(r'[^a-zA-Z0-9]+', '_', bn).lower()
+            elif case_type.startswith('CAMEL'):
+                parts = [p for p in re.split(r'[^a-zA-Z0-9]+', bn) if p]
+                if parts: 
+                    bn = parts[0].lower() + ''.join(p.capitalize() for p in parts[1:])
+            elif case_type.startswith('PASCAL'):
+                parts = [p for p in re.split(r'[^a-zA-Z0-9]+', bn) if p]
+                if parts: 
+                    bn = ''.join(p.capitalize() for p in parts)
             
             fn = tool.rename_template.replace("<NAME>", bn).replace("<DATA>", dt).replace("<ORA>", tm)
-            if '#' in fn: fn = re.sub(r'(#+)', lambda mh: f"{i:0{len(mh.group(1))}d}", fn)
+            if '#' in fn: 
+                fn = re.sub(r'(#+)', lambda mh: f"{i:0{len(mh.group(1))}d}", fn)
+                
             m.name = fn
             if m.use_nodes:
                 for node in m.node_tree.nodes:
                     if node.type == 'TEX_IMAGE' and node.image: node.image.name = fn
+                    
         return {'FINISHED'}
 
 class PHOTOMANAGER_OT_apply_tags(bpy.types.Operator):
@@ -219,19 +354,40 @@ class PHOTOMANAGER_OT_export_assets(bpy.types.Operator):
         tool = context.scene.photo_manager_tool
         dest = bpy.path.abspath(tool.export_folder)
         if not os.path.exists(dest): return {'CANCELLED'}
+        
+        scene = context.scene
+        old_format = scene.render.image_settings.file_format
+        old_color_mode = scene.render.image_settings.color_mode
+        
+        if tool.export_format != 'ORIGINAL':
+            scene.render.image_settings.file_format = tool.export_format
+            if tool.export_format == 'JPEG':
+                scene.render.image_settings.color_mode = 'RGB' 
+        
         for m in get_selected_materials(context):
             img = next((n.image for n in m.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image), None) if m.use_nodes else None
             if img:
-                if tool.export_format != 'ORIGINAL': img.file_format = tool.export_format
-                ext = ".jpg" if img.file_format == 'JPEG' else ".png"
-                img.filepath_raw = os.path.join(dest, m.name + ext)
-                img.save()
+                ext = ".jpg" if tool.export_format == 'JPEG' else (".png" if tool.export_format == 'PNG' else ".tif")
+                if tool.export_format == 'ORIGINAL':
+                    ext = os.path.splitext(img.filepath)[1] or ".png"
+                
+                target_path = os.path.join(dest, m.name + ext)
+                
+                if tool.export_format != 'ORIGINAL':
+                    img.save_render(filepath=target_path, scene=scene)
+                else:
+                    img.save_render(filepath=target_path)
+                    
+        scene.render.image_settings.file_format = old_format
+        scene.render.image_settings.color_mode = old_color_mode
+        
         return {'FINISHED'}
 
 def register():
     bpy.utils.register_class(PHOTOMANAGER_OT_view_nav)
     bpy.utils.register_class(PHOTOMANAGER_OT_get_dimensions)
     bpy.utils.register_class(PHOTOMANAGER_OT_edit_image)
+    bpy.utils.register_class(PHOTOMANAGER_OT_update_previews)
     bpy.utils.register_class(PHOTOMANAGER_OT_slideshow)
     bpy.utils.register_class(PHOTOMANAGER_OT_view_image)
     bpy.utils.register_class(PHOTOMANAGER_OT_import_assets)
@@ -248,6 +404,7 @@ def unregister():
     bpy.utils.unregister_class(PHOTOMANAGER_OT_import_assets)
     bpy.utils.unregister_class(PHOTOMANAGER_OT_view_image)
     bpy.utils.unregister_class(PHOTOMANAGER_OT_slideshow)
+    bpy.utils.unregister_class(PHOTOMANAGER_OT_update_previews)
     bpy.utils.unregister_class(PHOTOMANAGER_OT_edit_image)
     bpy.utils.unregister_class(PHOTOMANAGER_OT_get_dimensions)
     bpy.utils.unregister_class(PHOTOMANAGER_OT_view_nav)
