@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Photo Manager (Asset Browser)",
-    "author": "Tu",
-    "version": (1, 6),
+    "author": "YourName",
+    "version": (1, 15),
     "blender": (3, 0, 0),
     "location": "Asset Browser > Sidebar (N)",
-    "description": "Gestore completo foto: importazione, modifica fisica, tag, slideshow e conversione",
+    "description": "Full photo management: Viewer, Slideshow, Template-based Rename, Batch Edit",
     "category": "System",
 }
 
